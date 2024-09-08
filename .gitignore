@@ -1,3 +1,4 @@
 *.pkl
 cifar100_test_mod.csv
 cifar100_train.csv
+prediction_dir/
