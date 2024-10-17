@@ -1,129 +1,187 @@
-import torch
-import pandas as pd
-import numpy as np
-import pickle
-from torch.utils.data import Dataset, DataLoader
-from torchvision.transforms import ToPILImage, Compose, Resize, Normalize, ToTensor
+import wandb, torch, tqdm, sys, os, json, math, gc
+from pathlib import Path
+sys.path.append(Path(__file__).parent.parent.__str__())
+from typing import List, Tuple, Union, Any
+from dataset import CIFARDataset
 from transformers import ViTForImageClassification
-from sklearn.metrics import accuracy_score
-from tqdm import tqdm
+from torch.utils.data import Dataset
 
-# Dataset class for loading CSV data
-class CIFAR100CSVDataset(Dataset):
-    def __init__(self, csv_file, transform=None):
-        self.data_frame = pd.read_csv(csv_file)
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.data_frame)
-
-    def __getitem__(self, idx):
-        image = self.data_frame.iloc[idx, :-1].values.astype(np.uint8).reshape(32, 32, 3)
-        label = int(self.data_frame.iloc[idx, -1])
-        if self.transform:
-            image = self.transform(image)
-        return image, label
-
-class CIFAR100CSVTest(Dataset):
-    def __init__(self, csv_file, transform=None):
-        self.data_frame = pd.read_csv(csv_file)
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.data_frame)
-
-    def __getitem__(self, idx):
-        # Assume each row contains only the image data (3072 columns)
-        image_data = self.data_frame.iloc[idx].values  # Get all pixel data
-        image = image_data.astype(np.uint8).reshape(32, 32, 3)  # Reshape into an image
-        if self.transform:
-            image = self.transform(image)
-        return image, idx  # Return the image and its index
-
-# Setup transformations
-def get_transform():
-    return Compose([
-        ToPILImage(),
-        Resize((224, 224)),
-        ToTensor(),
-        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-
-def train_model(model, train_loader, device, num_epochs=8):
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-5)
-    # scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=num_epochs, T_mult=2)  # Adjust T_0 and T_mult as needed
-
-    for epoch in tqdm(range(num_epochs)):
-        model.train()
-        total_loss = 0
-        for images, labels in tqdm(train_loader):
-            images, labels = images.to(device), labels.to(device)
-            outputs = model(images, labels=labels)
-            loss = outputs.loss
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+class ViTTrainer:
+    def __init__(self, device: torch.device, config: dict):
+        self.device = device
+        self.config = config
+        self.model_name_srt = config["model_name"].split("/")[-1]
+        self.num_epochs = config["num_epochs"]
+        self.wandb_log = config["wandb_log"]
+        self.calc_norm = config["calc_norm"]
+        self.project_name = f"vitB16-finetune-CIFAR100-final"
+        self.checkpoint_dir = Path(Path.cwd(), f"Assignment1/outputs/ckpt/{self.project_name}/{config['ckpt_key']}")
         
-        # scheduler.step()  # Step the scheduler at end of each epoch
-        print(f"Epoch {epoch+1}, Loss: {total_loss/len(train_loader)}")
-        checkpoint_path = f'checkpoint_clean/checkpoint_epoch_{epoch+1}.pkl'
-        with open(checkpoint_path, 'wb') as f:
-            pickle.dump(model.state_dict(), f)
+        self.model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k', num_labels=100).to(self.device)
+        self.optimizer = torch.optim.AdamW(params=self.model.parameters(), lr=self.config["initial_learning_rate"], weight_decay=self.config["weight_decay"])
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(self.optimizer, T_0=1, eta_min=1e-5)
+        self.train_ds = CIFARDataset(npz_file="/raid/speech/soumen/gnr/IITB-GNR650-ADLCV/Assignment1/outputs/denoised_image_labels_for_reshuffled_noisy_data.npz")
+        self.test_ds = CIFARDataset(npz_file="/raid/speech/soumen/gnr/IITB-GNR650-ADLCV/Assignment1/outputs/test_image_labels.npz")
+        self.train_dl = self.train_ds.prepare_dataloader(batch_size=config["batch_size"], frac=config["train_frac"])
+        self.test_dl = self.test_ds.prepare_dataloader(batch_size=config["batch_size"], frac=config["test_frac"])
+        
+        if self.wandb_log:
+            wandb.init(project=self.project_name, config=config)
+            wandb.watch(self.model, log="all")
+            wandb.define_metric("train/step")
+            wandb.define_metric("test/step")
+            wandb.define_metric("train/*", step_metric="train/step")
+            wandb.define_metric("test/*", step_metric="test/step")
 
-
-# Function to evaluate the model
-def evaluate_model(model, predict_loader, device, checkpoint_dir, actual_labels_path):
-    actual_labels_df = pd.read_csv(actual_labels_path)
-    num_checkpoints = 8
-    for epoch in tqdm(range(1, num_checkpoints + 1)):
-        checkpoint_path = f'{checkpoint_dir}checkpoint_clean/checkpoint_epoch_{epoch}.pkl'
-        with open(checkpoint_path, 'rb') as f:
-            model.load_state_dict(pickle.load(f))
-
-        model.eval()
-        predictions = []
-        for images, ids in tqdm(predict_loader):
-            images = images.to(device)
-            with torch.no_grad():
-                outputs = model(images)
-                preds = torch.argmax(outputs.logits, dim=1).cpu().numpy()
-            predictions.extend(zip(ids.numpy(), preds))
-
-        predictions_df = pd.DataFrame(predictions, columns=['ID', 'Target'])
-        predictions_df.to_csv(f'/raid/biplab/sarthak/GNR_650/predictions_epoch_{epoch}.csv', index=False)
-        predictions_df = predictions_df.sort_values('ID').reset_index(drop=True)
-        accuracy = accuracy_score(actual_labels_df['Label'], predictions_df['Target'])
-
-        print(f'Accuracy for checkpoint {epoch}: {accuracy * 100:.2f}%')
-
-# Main function to coordinate the workflow
-def main():
-    # Initialize the dataset
-    train_transform = get_transform()
-    train_dataset = CIFAR100CSVDataset('/raid/biplab/sarthak/GNR_650/cifar100_train.csv', transform=train_transform)
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=8)
-
-    # Load model and feature extractor
-    model = ViTForImageClassification.from_pretrained('google/vit-base-patch16-224-in21k', num_labels=100)
-    device = torch.device("cuda:7" if torch.cuda.is_available() else "cpu")
+    def _find_norm(self, is_grad: bool) -> float:
+        norm = 0
+        for val in self.model.parameters():
+            if val.requires_grad:
+                if is_grad:
+                    k = val
+                else:
+                    k = val.grad if val.grad is not None else torch.tensor(0.0, device=self.device)
+                norm += (k ** 2).sum().item()
+        norm = norm ** 0.5  
+        return norm
     
-    # Freeze all layers except the last block and the classifier head
-    for name, param in model.named_parameters():
-        if name.startswith('vit.encoder.layer.11') or name.startswith('vit.encoder.layer.10') or name.startswith('vit.encoder.layer.9') or 'classifier' in name:
-            param.requires_grad = True
+    def _save_checkpoint(self, ep: int) -> None:
+        checkpoint = {"epoch": ep, "model_state": self.model.state_dict(), "opt_state": self.optimizer.state_dict()}   
+        if not Path.exists(self.checkpoint_dir):
+            Path.mkdir(self.checkpoint_dir, parents=True, exist_ok=True)
+        checkpoint_path = Path(self.checkpoint_dir, f"ckpt_ep_{ep}.pth")
+        torch.save(checkpoint, checkpoint_path)
+        print(f"[SAVE] ep: {ep}/{self.num_epochs-1}, checkpoint saved at: {checkpoint_path}")
+    
+    def _forward_batch(self, batch: dict, is_train: bool) -> torch.tensor:
+        x, y = batch # (b, 3, 224, 224), (b,)
+        x, y = x.to(self.device), y.to(self.device) 
+        if is_train:
+            self.model.train()
+            out = self.model(x).logits
+            out.requires_grad_(True)
+            assert out.requires_grad == True
         else:
-            param.requires_grad = False
-    model.to(device)
+            self.model.eval()
+            with torch.no_grad():
+                out = self.model(x).logits
+        return out # (b, c)
+        
+    def _calc_loss_batch(self, pred_outputs: torch.tensor, true_outputs: torch.tensor) -> torch.tensor:
+        pred_outputs = pred_outputs.to(self.device)
+        true_outputs = true_outputs.to(self.device)
+        assert pred_outputs.dim() == 2, f"pred_outputs.shape = {pred_outputs.shape} must be (b, c)"
+        assert true_outputs.dim() == 1, f"true_outputs.shape = {true_outputs.shape} must be (b,)"
+        loss = torch.nn.functional.cross_entropy(input=pred_outputs, target=true_outputs)
+        return loss # returns the computational graph also along with it
+        
+    def _calc_acc_batch(self, pred_outputs: torch.tensor, true_outputs: torch.tensor) -> torch.tensor:
+        pred_outputs = pred_outputs.to(self.device)
+        true_outputs = true_outputs.to(self.device)
+        assert pred_outputs.dim() == 2, f"pred_outputs.shape = {pred_outputs.shape} must be (b, c)"
+        assert true_outputs.dim() == 1, f"true_outputs.shape = {true_outputs.shape} must be (b,)"
+        acc = (pred_outputs.argmax(dim=-1) == true_outputs).to(torch.float32).mean()
+        return torch.tensor(acc.item()) # returns the tensor as a scalar number
 
-    # Train the model
-    # train_model(model, train_loader, device)
+    def _optimize_batch(self, pred_outputs: torch.tensor, true_outputs: torch.tensor, ep: int, batch_index: int) -> Tuple[float, float, float, float]:  
+        loss = self._calc_loss_batch(pred_outputs=pred_outputs, true_outputs=true_outputs)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()       
+        gn = self._find_norm(True) if self.calc_norm else -1
+        pn = self._find_norm(False) if self.calc_norm else -1 
+        lr = self.optimizer.param_groups[0]['lr'] 
+        torch.nn.utils.clip_grad_norm_(parameters=self.model.parameters(), max_norm=self.config["clip_grad_norm_value"], norm_type=2.0)
+        self.optimizer.step()
+        self.scheduler.step(ep + batch_index/len(self.train_dl))
+        return loss.item(), gn, pn, lr
+    
+    def _optimize_dataloader(self, ep: int) -> None:  
+        with tqdm.tqdm(iterable=self.train_dl, desc=f"[TRAIN] ep: {ep}/{self.num_epochs-1}", total=len(self.train_dl), unit="step", colour="green") as pbar:
+            for i, batch in enumerate(pbar):    
+                pred_out = self._forward_batch(batch=batch, is_train=True) # (b, c)  
+                true_out = batch[1] # (b,)   
+                loss, gn, pn, lr = self._optimize_batch(pred_outputs=pred_out, true_outputs=true_out, ep=ep, batch_index=i)
+                acc = self._calc_acc_batch(pred_outputs=pred_out, true_outputs=true_out)
+                if self.wandb_log:
+                    wandb.log({"train/loss": loss, "train/accuracy": acc, "train/learning_rate": lr, "train/grad_norm": gn, "train/param_norm": pn, "train/epoch": ep, "train/step": self.train_step})
+                    self.train_step += 1
+                pbar.set_postfix({"loss": f"{loss:.3f}", "acc": f"{acc:.3f}", "lr": f"{lr:.3e}", "gn": f"{gn:.3f}", "pn": f"{pn:.3f}"})
+    
+    def _test_dataloader(self, ep: int) -> None:  
+        with tqdm.tqdm(iterable=self.test_dl, desc=f"[TEST] ep: {ep}/{self.num_epochs-1}", total=len(self.test_dl), unit="step", colour="green") as pbar:
+            for i, batch in enumerate(pbar):    
+                pred_out = self._forward_batch(batch=batch, is_train=False) # (b, c)  
+                true_out = batch[1] # (b,)   
+                acc = self._calc_acc_batch(pred_outputs=pred_out, true_outputs=true_out)
+                loss = self._calc_loss_batch(pred_outputs=pred_out, true_outputs=true_out).item()
+                if self.wandb_log:
+                    wandb.log({"test/loss": loss, "test/accuracy": acc, "test/epoch": ep, "test/step": self.test_step})
+                    self.test_step += 1
+                pbar.set_postfix({"loss": f"{loss:.3f}", "acc": f"{acc:.3f}"})
+            
+    def _unfreeze_layers(self, layers_list: List[str]) -> None:
+        """['cls_head', 'base.pooler', ...]"""
+        if layers_list == ["all"]:
+            for val in self.model.parameters():
+                val.requires_grad_(True)
+        else:
+            for val in self.model.parameters():
+                val.requires_grad_(False)
+            for name, val in self.model.named_parameters():
+                for layer in layers_list:
+                    if name.startswith(layer):
+                        val.requires_grad_(True)
+                        break
+        print(f"Gradients are computed for: ", [name for name, val in self.model.named_parameters() if val.requires_grad])
+        total_params = sum([i.numel() for i in self.model.parameters()])
+        total_trainable_params = sum([i.numel() for i in self.model.parameters() if i.requires_grad])
+        print(f"Total number of parameters: {total_params}")
+        print(f"Total number of trainable parameters: {total_trainable_params}")
+        print(f"Finetuning efficiency: {total_trainable_params/total_params*100:.2f}%")
+        
+    def train(self) -> None:
+        layers_list = ["all"]
+        self._unfreeze_layers(layers_list=layers_list)
+        self.train_step = 0
+        self.test_step = 0
+        for ep in range(self.num_epochs):
+            self._optimize_dataloader(ep=ep)
+            self._test_dataloader(ep=ep)
+            self._save_checkpoint(ep=ep)
+        if self.wandb_log:
+            wandb.finish()
+    
+    def _load_checkpoint(self, name: str = "ckpt_ep_0.pth") -> None:
+        checkpoint_path = Path(self.checkpoint_dir, name)
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint["model_state"])
+        self.optimizer.load_state_dict(checkpoint["opt_state"])
+        print(f"[LOAD] ep: {checkpoint['epoch']}, checkpoint loaded from: {checkpoint_path}")
 
-    # Predict and evaluate
-    predict_dataset = CIFAR100CSVTest('/raid/biplab/sarthak/GNR_650/cifar100_test_mod.csv', transform=train_transform)
-    predict_loader = DataLoader(predict_dataset, batch_size=128, shuffle=False, num_workers=8)
-    evaluate_model(model, predict_loader, device, '/raid/biplab/sarthak/GNR_650/', '/raid/biplab/sarthak/GNR_650/cifar100_test_labels.csv')
+def main(model_name: str, device: torch.device) -> None:
+    config = {
+        "model_name": model_name,
+        "num_epochs": 2, 
+        "batch_size": 128,
+        "train_frac": 1.0,
+        "test_frac": 1.0,
+        "num_class": 100,
+        "clip_grad_norm_value": 10.0,
+        "initial_learning_rate": 0.0001, 
+        "weight_decay": 0.1,
+        "ckpt_key": "denoise_all_alt",
+        "calc_norm": True,
+        "wandb_log": True
+    }
+    trainer = ViTTrainer(device=device, config=config)
+    trainer.train()
+    print("DONE")
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+    torch.cuda.empty_cache()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using {device}...")
+    
+    main('google/vit-base-patch16-224-in21k', device=device)
+        
